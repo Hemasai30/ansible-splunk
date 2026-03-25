@@ -1,5 +1,5 @@
 ---
-- name: Upgrade Splunk UF to 10.2.0 (AWS-friendly simplified)
+- name: Upgrade Splunk UF to 10.2.0 (AWS-friendly, dynamic systemd support)
   hosts: all
   become: yes
   gather_facts: no
@@ -54,6 +54,9 @@
         upgrade_needed: true
         splunk_running: false
         upgrade_success: false
+        systemd_unit_exists: false
+        systemd_unit_name: ""
+        systemd_unit_path: ""
 
   tasks:
     - name: Check splunk binary exists
@@ -155,12 +158,116 @@
           failed_when: false
           when: upgrade_needed
 
-        - name: Start Splunk
+        - name: Check for SplunkForwarder.service
+          stat:
+            path: "/etc/systemd/system/SplunkForwarder.service"
+          register: splunkforwarder_unit_stat
+
+        - name: Check for splunk.service
+          stat:
+            path: "/etc/systemd/system/splunk.service"
+          register: splunk_unit_stat
+
+        - name: Check vendor SplunkForwarder.service
+          stat:
+            path: "/usr/lib/systemd/system/SplunkForwarder.service"
+          register: splunkforwarder_vendor_unit_stat
+
+        - name: Check vendor splunk.service
+          stat:
+            path: "/usr/lib/systemd/system/splunk.service"
+          register: splunk_vendor_unit_stat
+
+        - name: Create Splunk boot-start service file if missing
+          shell: "{{ splunk_bin }} enable boot-start --accept-license --answer-yes --no-prompt"
+          register: boot_start_create_result
+          changed_when: false
+          failed_when: false
+          when: >
+            upgrade_needed and
+            not splunkforwarder_unit_stat.stat.exists and
+            not splunk_unit_stat.stat.exists and
+            not splunkforwarder_vendor_unit_stat.stat.exists and
+            not splunk_vendor_unit_stat.stat.exists
+
+        - name: Re-check for SplunkForwarder.service
+          stat:
+            path: "/etc/systemd/system/SplunkForwarder.service"
+          register: splunkforwarder_unit_stat_after
+
+        - name: Re-check for splunk.service
+          stat:
+            path: "/etc/systemd/system/splunk.service"
+          register: splunk_unit_stat_after
+
+        - name: Re-check vendor SplunkForwarder.service
+          stat:
+            path: "/usr/lib/systemd/system/SplunkForwarder.service"
+          register: splunkforwarder_vendor_unit_stat_after
+
+        - name: Re-check vendor splunk.service
+          stat:
+            path: "/usr/lib/systemd/system/splunk.service"
+          register: splunk_vendor_unit_stat_after
+
+        - name: Determine available systemd unit
+          set_fact:
+            systemd_unit_name: >-
+              {%- if splunkforwarder_unit_stat_after.stat.exists or splunkforwarder_vendor_unit_stat_after.stat.exists -%}
+              SplunkForwarder.service
+              {%- elif splunk_unit_stat_after.stat.exists or splunk_vendor_unit_stat_after.stat.exists -%}
+              splunk.service
+              {%- else -%}
+              none
+              {%- endif -%}
+            systemd_unit_path: >-
+              {%- if splunkforwarder_unit_stat_after.stat.exists -%}
+              /etc/systemd/system/SplunkForwarder.service
+              {%- elif splunkforwarder_vendor_unit_stat_after.stat.exists -%}
+              /usr/lib/systemd/system/SplunkForwarder.service
+              {%- elif splunk_unit_stat_after.stat.exists -%}
+              /etc/systemd/system/splunk.service
+              {%- elif splunk_vendor_unit_stat_after.stat.exists -%}
+              /usr/lib/systemd/system/splunk.service
+              {%- else -%}
+              none
+              {%- endif -%}
+            systemd_unit_exists: >-
+              {{
+                (
+                  splunkforwarder_unit_stat_after.stat.exists
+                  or splunk_unit_stat_after.stat.exists
+                  or splunkforwarder_vendor_unit_stat_after.stat.exists
+                  or splunk_vendor_unit_stat_after.stat.exists
+                ) | bool
+              }}
+
+        - name: Reload systemd daemon
+          shell: "systemctl daemon-reload"
+          changed_when: false
+          failed_when: false
+          when: systemd_unit_exists
+
+        - name: Enable discovered systemd unit
+          shell: "systemctl enable {{ systemd_unit_name }}"
+          register: enable_unit_result
+          changed_when: false
+          failed_when: false
+          when: systemd_unit_exists and systemd_unit_name != "none"
+
+        - name: Start discovered systemd unit
+          shell: "systemctl restart {{ systemd_unit_name }}"
+          register: systemd_start_result
+          changed_when: false
+          failed_when: false
+          when: systemd_unit_exists and systemd_unit_name != "none"
+
+        - name: Start Splunk directly if no systemd unit found
           shell: "timeout 180 {{ splunk_bin }} start --accept-license --answer-yes --no-prompt"
           register: start_result
           changed_when: false
           failed_when: false
-          when: upgrade_needed
+          when: not systemd_unit_exists and upgrade_needed
 
         - name: Verify installed version
           shell: "{{ splunk_bin }} version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1"
@@ -178,6 +285,13 @@
           changed_when: false
           failed_when: false
 
+        - name: Check discovered systemd unit status
+          shell: "systemctl status {{ systemd_unit_name }} 2>&1 || true"
+          register: systemd_status_out
+          changed_when: false
+          failed_when: false
+          when: systemd_unit_exists and systemd_unit_name != "none"
+
         - name: Set result facts
           set_fact:
             splunk_running: "{{ (splunk_process.stdout | default('') | trim | length) > 0 }}"
@@ -190,6 +304,8 @@
               Validation failed:
               verified_version="{{ version_verified }}"
               process_found="{{ (splunk_process.stdout | default('') | trim | length) > 0 }}"
+              systemd_unit_name="{{ systemd_unit_name }}"
+              systemd_unit_path="{{ systemd_unit_path }}"
           when: host_failed
 
       rescue:
@@ -206,6 +322,14 @@
           failed_when: false
           ignore_errors: true
 
+        - name: Collect final discovered systemd unit status
+          shell: "systemctl status {{ systemd_unit_name }} 2>&1 || true"
+          register: final_systemd_status
+          changed_when: false
+          failed_when: false
+          ignore_errors: true
+          when: systemd_unit_exists and systemd_unit_name != "none"
+
         - name: Recalculate final running state
           set_fact:
             splunk_running: "{{ (splunk_process_status.stdout | default('') | trim | length) > 0 }}"
@@ -220,6 +344,9 @@
               Running={{ splunk_running }}
               UpgradeSuccess={{ upgrade_success }}
               Failed={{ host_failed }}
+              SystemdUnitExists={{ systemd_unit_exists }}
+              SystemdUnitName={{ systemd_unit_name }}
+              SystemdUnitPath={{ systemd_unit_path }}
               Reason="{{ failure_reason }}"
 
 - name: Generate failed hosts report
@@ -350,4 +477,4 @@
           Files created:
           - ./failed_hosts.txt
           - ./failed_stopped_hosts.txt
-          - ./splunk_upgrade_status_report.txt
+          - ./splunk_upgrade_status_report.txt Yes — the images confirm your latest requirement is valid.
