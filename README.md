@@ -1,5 +1,5 @@
 ---
-- name: Upgrade Splunk UF to 10.2.0 (hardened, no systemctl checks)
+- name: Upgrade Splunk UF to 10.2.0 (AWS-friendly simplified)
   hosts: all
   become: yes
   gather_facts: no
@@ -7,7 +7,8 @@
 
   vars:
     target_version: "10.2.0"
-    splunk_bin: "/opt/splunkforwarder/bin/splunk"
+    splunk_home: "/opt/splunkforwarder"
+    splunk_bin: "{{ splunk_home }}/bin/splunk"
 
     splunk_pkg_url: "http://repo.abbvienet.com/linux/splunkforwarder"
     splunk_x86_rpm_url: "{{ splunk_pkg_url }}/splunkforwarder-10.2.0-d749cb17ea65.x86_64.rpm"
@@ -45,14 +46,14 @@
 
     - name: Initialize host status
       set_fact:
+        reached_host: true
         host_failed: false
         failure_reason: ""
+        current_version: "not_installed"
+        version_verified: ""
+        upgrade_needed: true
         splunk_running: false
         upgrade_success: false
-        current_version: "not_installed"
-        upgrade_needed: true
-        version_verified: ""
-        reached_host: true
 
   tasks:
     - name: Check splunk binary exists
@@ -67,82 +68,84 @@
       failed_when: false
       when: splunk_bin_stat.stat.exists
 
-    - name: Set version facts
+    - name: Set current version facts
       set_fact:
         current_version: "{{ current_out.stdout | default('not_installed') | trim | default('not_installed') }}"
-        upgrade_needed: "{{ (current_out.stdout | default('')) | trim != target_version }}"
+        upgrade_needed: "{{ (current_out.stdout | default('') | trim) != target_version }}"
 
-    - name: Show current status
+    - name: Show host status
       debug:
-        msg: "Host={{ inventory_hostname }} UF={{ current_version }} target={{ target_version }} upgrade_needed={{ upgrade_needed }}"
+        msg: "Host={{ inventory_hostname }} Current={{ current_version }} Target={{ target_version }} UpgradeNeeded={{ upgrade_needed }}"
 
     - name: Upgrade workflow
       block:
-        - name: Stop splunk if upgrading and installed
-          shell: "timeout 60 {{ splunk_bin }} stop"
+        - name: Stop splunk if installed and upgrade needed
+          shell: "timeout 120 {{ splunk_bin }} stop"
           register: stop_result
           changed_when: false
           failed_when: false
           when: upgrade_needed and current_version != 'not_installed'
 
-        - name: Download RPM for RHEL/Amazon Linux x86_64
+        - name: Download x86 RPM
           get_url:
             url: "{{ splunk_x86_rpm_url }}"
             dest: "{{ x86_rpm_dest }}"
             mode: "0644"
-            timeout: 30
+            timeout: 60
           when: upgrade_needed and ansible_os_family == "RedHat" and ansible_architecture in ["x86_64", "amd64"]
 
-        - name: Download RPM for RHEL/Amazon Linux arm64
+        - name: Download arm RPM
           get_url:
             url: "{{ splunk_arm_rpm_url }}"
             dest: "{{ arm_rpm_dest }}"
             mode: "0644"
-            timeout: 30
+            timeout: 60
           when: upgrade_needed and ansible_os_family == "RedHat" and ansible_architecture in ["arm64", "aarch64"]
 
-        - name: Install RPM for RHEL/Amazon Linux x86_64
-          package:
-            name: "{{ x86_rpm_dest }}"
-            state: present
-          register: pkg_install_result
+        - name: Install x86 RPM
+          shell: "rpm -Uvh --force --nodeps {{ x86_rpm_dest }}"
+          register: rpm_install_x86
+          changed_when: true
+          failed_when: false
           when: upgrade_needed and ansible_os_family == "RedHat" and ansible_architecture in ["x86_64", "amd64"]
 
-        - name: Install RPM for RHEL/Amazon Linux arm64
-          package:
-            name: "{{ arm_rpm_dest }}"
-            state: present
-          register: pkg_install_result
+        - name: Install arm RPM
+          shell: "rpm -Uvh --force --nodeps {{ arm_rpm_dest }}"
+          register: rpm_install_arm
+          changed_when: true
+          failed_when: false
           when: upgrade_needed and ansible_os_family == "RedHat" and ansible_architecture in ["arm64", "aarch64"]
 
-        - name: Download DEB for Debian/Ubuntu amd64
+        - name: Download amd64 DEB
           get_url:
             url: "{{ splunk_amd_deb_url }}"
             dest: "{{ amd_deb_dest }}"
             mode: "0644"
-            timeout: 30
+            timeout: 60
           when: upgrade_needed and ansible_os_family == "Debian" and ansible_architecture in ["x86_64", "amd64"]
 
-        - name: Download DEB for Debian/Ubuntu arm64
+        - name: Download arm64 DEB
           get_url:
             url: "{{ splunk_arm_deb_url }}"
             dest: "{{ arm_deb_dest }}"
             mode: "0644"
-            timeout: 30
+            timeout: 60
           when: upgrade_needed and ansible_os_family == "Debian" and ansible_architecture in ["arm64", "aarch64"]
 
-        - name: Install DEB for Debian/Ubuntu amd64
+        - name: Install amd64 DEB
           apt:
             deb: "{{ amd_deb_dest }}"
             state: present
-          register: pkg_install_result
+          register: deb_install_amd
+          failed_when: false
           when: upgrade_needed and ansible_os_family == "Debian" and ansible_architecture in ["x86_64", "amd64"]
 
-        - name: Install DEB for Debian/Ubuntu arm64
+        - name: Install arm64 DEB
           apt:
             deb: "{{ arm_deb_dest }}"
             state: present
-          register: pkg_install_result
+          register: deb_install_arm
+          failed_when: false
           when: upgrade_needed and ansible_os_family == "Debian" and ansible_architecture in ["arm64", "aarch64"]
 
         - name: Enable Splunk boot-start
@@ -152,14 +155,14 @@
           failed_when: false
           when: upgrade_needed
 
-        - name: Start splunk
+        - name: Start Splunk
           shell: "timeout 180 {{ splunk_bin }} start --accept-license --answer-yes --no-prompt"
           register: start_result
           changed_when: false
           failed_when: false
           when: upgrade_needed
 
-        - name: Verify version
+        - name: Verify installed version
           shell: "{{ splunk_bin }} version 2>&1 | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1"
           register: verify_out
           changed_when: false
@@ -169,65 +172,34 @@
           set_fact:
             version_verified: "{{ verify_out.stdout | default('') | trim }}"
 
-        - name: Check splunk status directly
-          shell: "{{ splunk_bin }} status 2>&1 || true"
-          register: splunk_status_cmd
-          changed_when: false
-          failed_when: false
-
         - name: Check splunk process
           shell: "pgrep -fa splunkd || true"
           register: splunk_process
           changed_when: false
           failed_when: false
 
-        - name: Set host result facts
+        - name: Set result facts
           set_fact:
             splunk_running: "{{ (splunk_process.stdout | default('') | trim | length) > 0 }}"
             upgrade_success: "{{ (not upgrade_needed) or ((version_verified == target_version) and ((splunk_process.stdout | default('') | trim | length) > 0)) }}"
             host_failed: "{{ not ((not upgrade_needed) or ((version_verified == target_version) and ((splunk_process.stdout | default('') | trim | length) > 0))) }}"
 
-        - name: Set failure reason when validation fails
+        - name: Set failure reason
           set_fact:
             failure_reason: >-
-              Version/process validation failed.
+              Validation failed:
               verified_version="{{ version_verified }}"
               process_found="{{ (splunk_process.stdout | default('') | trim | length) > 0 }}"
-              splunk_status="{{ splunk_status_cmd.stdout | default('') }}"
-          when: host_failed
-
-        - name: Fail host explicitly if upgrade validation failed
-          fail:
-            msg: "{{ failure_reason }}"
           when: host_failed
 
       rescue:
-        - name: Mark host failed from rescued exception
+        - name: Mark host failed after exception
           set_fact:
             host_failed: true
-            failure_reason: "Upgrade workflow hit an exception on host {{ inventory_hostname }}"
-
-        - name: Capture splunk CLI status after failure
-          shell: "{{ splunk_bin }} status 2>&1 || true"
-          register: rescue_splunk_status
-          changed_when: false
-          failed_when: false
-
-        - name: Capture splunk process after failure
-          shell: "pgrep -fa splunkd || true"
-          register: rescue_splunk_process
-          changed_when: false
-          failed_when: false
+            failure_reason: "Upgrade workflow exception on {{ inventory_hostname }}"
 
       always:
-        - name: Collect final splunk CLI status
-          shell: "{{ splunk_bin }} status 2>&1 || true"
-          register: splunk_cli_status
-          changed_when: false
-          failed_when: false
-          ignore_errors: true
-
-        - name: Collect final splunk process state
+        - name: Collect final process state
           shell: "pgrep -fa splunkd || true"
           register: splunk_process_status
           changed_when: false
@@ -238,7 +210,7 @@
           set_fact:
             splunk_running: "{{ (splunk_process_status.stdout | default('') | trim | length) > 0 }}"
 
-        - name: Final host summary
+        - name: Final summary
           debug:
             msg: >-
               Host={{ inventory_hostname }}
@@ -250,7 +222,7 @@
               Failed={{ host_failed }}
               Reason="{{ failure_reason }}"
 
-- name: Generate failed hosts report (control node)
+- name: Generate failed hosts report
   hosts: localhost
   gather_facts: yes
   tasks:
